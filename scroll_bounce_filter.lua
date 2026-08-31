@@ -1,113 +1,119 @@
---- [7] 스크롤 반대로 튐 방지 (gap-gating + 연속 역방향 카운트 + 누적-방출)
--- 실측(2026-07-30 + 2026-08-14 재조사): "아래로 굴리는데 순간 위로 톡" =
---   한 방향 스트림 속 짧은 역방향 run(스퓨리어스). 진짜 반전은 길게 지속.
--- 판별 로직 v3 (통합 run 카운터, magnitude 무시):
---   v2(가속-서명)는 틀린 전제였다 — 실측(260틱 fp-trace) 결과 튐과 진짜 반전은
---   magnitude·fp·타이밍 어느 축으로도 안 갈린다(분포 전 구간 겹침). 유일하게
---   신뢰할 성질은 run 길이뿐이고 그것도 연속 분포다. 이 마우스 튐은 최대 4틱까지 옴.
---   · 역방향이 연속 flipTicks(=4)개 모이기 전엔 튐으로 보고 억제(delta 0화).
---   · flipTicks개 이상 연속이면 진짜 반전 → 방향 전환 후 통과.
---   · 같은 방향 틱이 오면 run 리셋(→ 짧은 튐 run은 원방향 복귀 시 흡수).
--- v4 (누적-방출): 억제 틱을 0화(손실) 대신 버퍼에 쌓았다가 반전 확정 시 몰아 방출 →
---   진짜 반전 거리 무손실(첫 flipTicks-1틱이 사라지지 않고 확정틱에 따라잡음).
--- v5 (gap-gating): 마지막 휠 틱 뒤 150ms 이상 멈춘 후 시작한 역방향은 의도적 반전으로
---   즉시 확정. 멈칫 없는 반전/튐은 기존 v4로 판정해 튐 억제 정확도를 낮추지 않는다.
---   긴 gap 전의 보류 버퍼는 새 제스처에 섞지 않고 폐기한다.
--- v6 (잠정 확정 + 지연 방출, 2026-08-18 실측 2240틱 근거):
---   · 신사실: 튐은 제스처 "시작" 틱에서도 난다 — gapFlip 324회 중 52회 오판
---     (스퓨리어스-첫틱형 34 / 진짜반전-후-튐형 8 / 모호 12), 유저 진짜 틱 82개 씹힘.
---     flip 11회 중 7회도 튐이었고, 그 순간 버퍼 몰아방출이 역방향 점프를 만들었다.
---   · grace(잠정): gapFlip/flip 직후 flipGraceMs(200ms) 동안 반대 틱을 억제하지 않고
---     즉시 방향 복귀+통과("revert"). 방향은 잠정 기간 내 마지막 틱을 따른다.
---     → 씹힘(최악 증상) 제거. 잔여 = 시작 틱 1~2개 흔들림(정보 부재로 소멸 불가).
---   · 지연 방출: flip 순간 버퍼를 쏘지 않고 pendingDump 보류 → 다음 같은 방향 틱
---     (확정 증거)에 얹어 방출, revert면 폐기 → 오판 flip의 역방향 점프 소멸.
---     비용(정직): 정확히 flipTicks틱 반전 후 즉시 멈추면 보류분(≤3틱) 유실.
--- 트레이드오프(정직): flipTicks가 클수록 튐 억제↑, 반전 순간 저크(따라잡는 점프)↑.
---   4 = ≤3틱 튐 억제(대다수), 잔여 = 드문 4틱 튐. 여전히 새면 5로.
--- 억제는 삭제(return true)가 이 환경서 무효 → delta 0화(setProperty). 방향은 sticky.
--- 트랙패드(연속 pixel scroll)는 건드리지 않는다. 상세: ~/.hammerspoon/SCROLL_BOUNCE_FIX.md
+--- [7] 스크롤 반대로 튐 방지 — v8 "window 지배 방향 수렴 (dominant-direction window)"
+-- 이력 v1~v7과 실측 근거는 ~/.hammerspoon/SCROLL_BOUNCE_FIX.md / SCROLL_BOUNCE_HANDOFF.md.
+-- v8 배경 (2026-08-31, v7 실사용 트레이스 98행): 두 신사실이 v7을 반증.
+--   ① 스퓨리어스가 mag-1 단독 틱이 아니라 "가속 붙은 역방향 클러스터"(예 +2,+3,+6=+11)로도
+--      온다 → 카운트(flipTicks)·단독 타이머 방출로는 진짜 반전과 구분 불가, 그대로 post되어
+--      11줄 역점프. ② v7의 방향 상태는 "마지막 확정 1비트"라 한 번 오확정되면 이후 진짜
+--      틱이 absorb로 씹히고 스퓨리어스가 통과하는 역-잠금(lock-in)이 생김 = "방향 랜덤".
+-- v8 원리(유저 제안): 방향을 1비트가 아니라 **최근 질량(|delta| 합, 지수 감쇠)의 다수결**로.
+--   · 지배 방향 틱 → 즉시 통과 + 창에 적립.
+--   · 역방향 틱 → 보류(0화, 버퍼 적립). 지배쪽 틱이 다시 오면 보류분 폐기(absorb, 튐 흡수).
+--   · 진짜 반전 확정 2경로: (a) 창 소진(휴지·스트림 종료 후 holdMs 경과) → flip,
+--     (b) 미드스트림 — 역방향 질량 > massRatio × 창 질량 && 역방향 지속 ≥ spanMs → flip.
+--   · flip 시 보류 delta를 원본 이벤트 copy에 실어 post(도달 실측 2026-08-31 확인) 또는
+--     현재 틱에 얹어 방출. 오확정이 나도 창 다수결이라 다음 실 틱들이 즉시 되받아
+--     자기교정 — lock-in 구조 소멸.
+-- 신사실(2026-08-31 실측, 기존 프로브 반전): post한 이벤트는 tap에 **재진입한다**(~3ms).
+--   → echo 가드(직전 post delta와 일치 시 무가공 통과)로 이중 적립 차단.
+-- 트레이드오프(정직): 진짜 반전 첫 반응이 ~holdMs(휴지 후) 또는 창 소진까지(~windowMs,
+--   무휴지 반전) 지연. 잔여 한계: 스트림 "마지막" 틱이 클러스터 튐이고 후속 틱이 없으면
+--   창 소진 시점에 늦은 역점프 1회(후속 정보 부재 — 환원 불가).
+-- 억제는 삭제(return true)가 이 환경서 무효 → delta 0화(setProperty)로.
+-- 트랙패드(연속 pixel scroll)는 건드리지 않는다.
 local eventtap = hs.eventtap
 local event = hs.eventtap.event
 local props = event.properties
 
--- 방향을 뒤집는 데 필요한 "연속 역방향" 틱 수. 근거: 260틱 fp-trace 실측 + scroll_harness.py.
--- 활성 run 내부 간격은 판별에 쓰지 않고, 150ms 이상 휴지만 제스처 경계로 쓴다. magnitude도 안 씀.
-local flipTicks = 4
-local intentionalReverseGapMs = 150
-local flipGraceMs = 200  -- v6: flip/gapFlip 직후 잠정 기간(반대 틱 = 억제 없이 즉시 복귀)
+-- v8.1 (2026-08-31): 하드 윈도우(300ms 컷오프) → 지수 감쇠 질량. 실측(트레이스1)상
+--   같은 방향 연속 스크롤도 버스트 간 gap이 354~928ms라 하드 컷오프 창은 제스처 "도중"에
+--   비어버림 → 그 틈의 스퓨리어스 1틱이 timerFlip으로 역방향 post ("갈겨도 반대로" 회귀).
+--   감쇠 질량은 활발한 스크롤 뒤 소진까지 ~1.2s 침묵이 필요해 버스트 간 gap에 안 비고,
+--   진짜 반전은 문턱(ratio×감쇠질량)이 같이 내려가므로 미드스트림 경로로 확정된다.
+local tauMs     = 350   -- 지배 질량 감쇠 시정수. mass·e^(-Δt/τ)
+local drainEps  = 1.0   -- 감쇠 질량이 이 밑이면 "소진"(제스처 끝) 판정
+local holdMs    = 100   -- 소진 상태의 역방향 보류(경계 튐 흡수, 실측 복귀 28~90ms)
+local spanMs    = 150   -- 미드스트림 flip에 요구하는 역방향 지속 시간(클러스터는 ~30ms라 미달)
+local massRatio = 2.0   -- 미드스트림 flip: 보류 질량 > ratio × 감쇠 질량
 
 local committedDir = 0
-local reverseRun = 0   -- 연속 역방향 틱 수
-local lastWheelAt = nil
-local graceLeftMs = 0    -- v6: >0이면 잠정 상태. 틱 간 gap만큼 감산.
-local pendingDump = false -- v6: flip 후 확정틱 대기 중인 보류 버퍼
-
--- 누적-방출(v4) 버퍼: 억제한 역방향 틱의 delta를 0화(손실) 대신 여기 쌓는다.
---   · 튐이 원방향으로 되돌아가면(pass) 버퍼 폐기(움직임 0 — 튐 흡수).
---   · 반전 확정(flip)이면 버퍼를 그 틱에 몰아 더해 방출 → 진짜 반전 거리 무손실.
--- 트레이드오프: 손실 대신 반전 순간 "톡 튀며 따라잡는" 저크(최대 flipTicks-1틱 분).
+local domMass, domAt = 0, nil   -- 지배 방향 감쇠 질량(역방향은 hold 버퍼에)
+local holdDir = 0
+local holdStartAt, holdLastAt = nil, nil
+local holdTicks, holdMass = 0, 0
 local bufDa1, bufFp, bufPt = 0, 0, 0
+local holdTimer = nil        -- hs.timer 참조 유지 필수(미보관 시 GC로 미발화)
+local heldEventCopy = nil    -- 보류 틱 원본 copy — flip post 시 delta만 바꿔 재사용
+local echoL, echoF, echoP, echoUntil = nil, nil, nil, 0
 
--- 진단 카운터(동작 무관): 통과/억제된튐/반전확정. `scrollStats`로 조회.
-scrollStats = { passed = 0, droppedBounce = 0, flips = 0, gapFlips = 0, reverts = 0 }
+-- 진단: passed/held/absorbed(튐 폐기 틱수)/flips(미드스트림)/timerFlips(창 소진)/echoes
+scrollStats = { passed = 0, held = 0, absorbed = 0, flips = 0, timerFlips = 0, echoes = 0 }
 
 local function signDir(v)
     if v > 0 then return 1 elseif v < 0 then return -1 else return 0 end
 end
 
--- 결정 함수 (결정론 테스트 가능).
--- (dir[, mag[, gapMs]]) → "pass" | "flip" | "gapFlip" | "suppress". mag는 미사용(호환).
--- 전역 노출 이유: 이 환경선 newScrollEvent:post()가 eventtap에 도달하지 않아
---   (프로브 실측 6 post→0 관측) 이벤트 주입 검증이 불가하다. 결정은 이 함수,
---   delta/버퍼까지는 scrollProcessDeltas(..., nowSeconds) 직접 호출로 검증한다.
-function scrollDecide(dir, mag, gapMs)
-    -- v6 잠정 시계: 틱 사이 gap만큼 소모.
-    if graceLeftMs > 0 and gapMs ~= nil then
-        graceLeftMs = graceLeftMs - gapMs
-    end
-    -- 첫 스크롤: 방향 확정.
-    if committedDir == 0 then
-        committedDir = dir; reverseRun = 0; graceLeftMs = 0
-        return "pass"
-    end
-    -- 확정 방향과 같음: 통과 + 역방향 run 리셋.
-    if dir == committedDir then
-        reverseRun = 0
-        return "pass"
-    end
-    -- v6 잠정 기간 내 반박: 직전 flip/gapFlip이 오판일 가능성 → 억제 없이 즉시 복귀.
-    if graceLeftMs > 0 then
-        committedDir = dir; reverseRun = 0
-        return "revert"
-    end
-    -- 충분히 멈춘 뒤 시작한 역방향은 새 의도적 제스처로 보고 첫 틱부터 통과(잠정).
-    if gapMs ~= nil and gapMs >= intentionalReverseGapMs then
-        committedDir = dir; reverseRun = 0; graceLeftMs = flipGraceMs
-        return "gapFlip"
-    end
-    -- 역방향: 연속 flipTicks개 모이면 진짜 반전(잠정) → 방향 전환 후 통과.
-    reverseRun = reverseRun + 1
-    if reverseRun >= flipTicks then
-        committedDir = dir; reverseRun = 0; graceLeftMs = flipGraceMs
-        return "flip"
-    end
-    return "suppress"  -- 미확정 역방향(튐 후보)
+local function domMassAt(now)
+    if domAt == nil then return 0 end
+    return domMass * math.exp(-(now - domAt) * 1000 / tauMs)
+end
+
+local function addDomMass(now, mag)
+    domMass = domMassAt(now) + mag
+    domAt = now
+end
+
+local function clearHold()
+    holdDir = 0; holdStartAt = nil; holdLastAt = nil
+    holdTicks = 0; holdMass = 0
+    bufDa1, bufFp, bufPt = 0, 0, 0
+end
+
+-- flip 확정: 보류 방향을 지배로, 지배 질량은 보류 질량으로 재시작. 보류 delta 반환.
+local function doFlip(now)
+    committedDir = holdDir
+    domMass = holdMass; domAt = now
+    local l, f, p = bufDa1, bufFp, bufPt
+    clearHold()
+    return l, f, p
 end
 
 function scrollDecideReset()
-    committedDir = 0; reverseRun = 0
-    lastWheelAt = nil
-    bufDa1, bufFp, bufPt = 0, 0, 0
-    graceLeftMs = 0; pendingDump = false
+    committedDir = 0
+    domMass = 0; domAt = nil
+    clearHold()
+    if holdTimer then holdTimer:stop(); holdTimer = nil end
+    heldEventCopy = nil
+    echoL, echoF, echoP, echoUntil = nil, nil, nil, 0
+    scrollStats = { passed = 0, held = 0, absorbed = 0, flips = 0, timerFlips = 0, echoes = 0 }
 end
 
--- 배포 콜백이 그대로 사용하는 delta 변환 함수. nowSeconds 주입 시 결정론 검증 가능.
--- 반환: lineDelta, fixedPtDelta, pointDelta, decision
+-- 타이머 검사(결정론 코어): 보류 중 + 질량 소진 + holdMs 경과 → flip, 보류 delta 반환.
+-- 반환: l,f,p,"flip" (post 대상) | nil,"holding"(재검사 필요) | nil,"idle"
+function scrollTimerCheck(nowSeconds)
+    local now = nowSeconds or hs.timer.secondsSinceEpoch()
+    if holdDir == 0 then return nil, nil, nil, "idle" end
+    if domMassAt(now) < drainEps and (now - holdStartAt) * 1000 >= holdMs then
+        local l, f, p = doFlip(now)
+        scrollStats.timerFlips = scrollStats.timerFlips + 1
+        -- 재진입 echo 가드 등록(post는 프로덕션 몫)
+        echoL, echoF, echoP, echoUntil = l, f, p, now + 0.05
+        return l, f, p, "flip"
+    end
+    return nil, nil, nil, "holding"
+end
+
+-- delta 변환 코어 (결정론 테스트 — nowSeconds 주입).
+-- 반환: outLine, outFp, outPt, decision
+--   decision: "pass" | "echo" | "holdStart" | "hold" | "absorb" | "flip"
 function scrollProcessDeltas(lineDelta, fpDelta, ptDelta, nowSeconds)
     local now = nowSeconds or hs.timer.secondsSinceEpoch()
-    local gapMs = lastWheelAt and ((now - lastWheelAt) * 1000) or nil
-    lastWheelAt = now
+
+    -- echo 가드: 방금 post한 flip 이벤트의 재진입 → 무가공 통과(창 이중 적립 금지)
+    if now < echoUntil and lineDelta == echoL and fpDelta == echoF and ptDelta == echoP then
+        echoL, echoF, echoP, echoUntil = nil, nil, nil, 0
+        scrollStats.echoes = scrollStats.echoes + 1
+        return lineDelta, fpDelta, ptDelta, "echo"
+    end
 
     local sv = lineDelta
     if sv == 0 then sv = fpDelta end
@@ -116,57 +122,59 @@ function scrollProcessDeltas(lineDelta, fpDelta, ptDelta, nowSeconds)
     if dir == 0 then
         return lineDelta, fpDelta, ptDelta, "pass"
     end
-    local mag = lineDelta ~= 0 and (lineDelta < 0 and -lineDelta or lineDelta) or 1
-    local decision = scrollDecide(dir, mag, gapMs)
+    local mag = lineDelta ~= 0 and math.abs(lineDelta) or 1
 
-    if decision == "suppress" then
-        -- 튐 후보: delta는 보류하고 이번 이벤트는 0화한다.
-        bufDa1 = bufDa1 + lineDelta
-        bufFp  = bufFp  + fpDelta
-        bufPt  = bufPt  + ptDelta
-        scrollStats.droppedBounce = scrollStats.droppedBounce + 1
-        return 0, 0, 0, decision
-    end
-
-    if decision == "flip" then
-        -- v6: 몰아방출을 확정틱으로 연기. 이번 틱만 내보내고 보류분은 pendingDump 대기.
-        --   (flip 7/11이 튐 오판이었던 실측 — flip 순간 dump가 역방향 점프의 진원)
-        pendingDump = true
-        scrollStats.flips = scrollStats.flips + 1
+    -- 첫 스크롤: 방향 확정.
+    if committedDir == 0 then
+        committedDir = dir
+        addDomMass(now, mag)
         scrollStats.passed = scrollStats.passed + 1
-        return lineDelta, fpDelta, ptDelta, decision
+        return lineDelta, fpDelta, ptDelta, "pass"
     end
 
-    if decision == "revert" then
-        -- v6 잠정 반박: 직전 flip/gapFlip이 오판 → 보류분 폐기, 이 틱은 그대로 통과.
-        bufDa1, bufFp, bufPt = 0, 0, 0
-        pendingDump = false
-        scrollStats.reverts = (scrollStats.reverts or 0) + 1
-        scrollStats.passed = scrollStats.passed + 1
-        return lineDelta, fpDelta, ptDelta, decision
-    end
-
-    -- pass + pendingDump: 같은 방향 틱 = flip 확정 증거 → 보류분을 얹어 방출(무손실 따라잡기).
-    if decision == "pass" and pendingDump then
-        pendingDump = false
-        if gapMs == nil or gapMs < intentionalReverseGapMs then
-            local outDa1, outFp, outPt = lineDelta + bufDa1, fpDelta + bufFp, ptDelta + bufPt
-            bufDa1, bufFp, bufPt = 0, 0, 0
-            scrollStats.passed = scrollStats.passed + 1
-            return outDa1, outFp, outPt, decision
+    if dir == committedDir then
+        -- 지배 방향: 보류 중이었다면 보류분은 튐 → 폐기(화면 무반응).
+        local decision = "pass"
+        if holdDir ~= 0 then
+            scrollStats.absorbed = scrollStats.absorbed + holdTicks
+            clearHold()
+            decision = "absorb"
         end
-        -- stale(휴지 후 재개): 이전 제스처 보류분은 아래에서 폐기.
+        addDomMass(now, mag)
+        scrollStats.passed = scrollStats.passed + 1
+        return lineDelta, fpDelta, ptDelta, decision
     end
 
-    -- pass: 보류분은 튐. gapFlip: 보류분은 이전 제스처의 stale delta. 둘 다 폐기한다.
-    bufDa1, bufFp, bufPt = 0, 0, 0
-    pendingDump = false
-    if decision == "gapFlip" then
-        scrollStats.flips = scrollStats.flips + 1
-        scrollStats.gapFlips = (scrollStats.gapFlips or 0) + 1
+    -- 역방향: 보류 적립.
+    local decision = (holdDir == 0) and "holdStart" or "hold"
+    if holdDir == 0 then
+        holdDir = dir; holdStartAt = now
     end
-    scrollStats.passed = scrollStats.passed + 1
-    return lineDelta, fpDelta, ptDelta, decision
+    holdLastAt = now
+    holdTicks = holdTicks + 1
+    holdMass = holdMass + mag
+    bufDa1 = bufDa1 + lineDelta
+    bufFp  = bufFp  + fpDelta
+    bufPt  = bufPt  + ptDelta
+
+    local wm = domMassAt(now)
+    -- (a) 질량 소진 + holdMs 경과 (타이머 지연 백스톱: 틱 도착 시점에도 판정)
+    if wm < drainEps and (now - holdStartAt) * 1000 >= holdMs then
+        local oL, oF, oP = doFlip(now)
+        scrollStats.timerFlips = scrollStats.timerFlips + 1
+        scrollStats.passed = scrollStats.passed + 1
+        return oL, oF, oP, "flip"
+    end
+    -- (b) 미드스트림: 질량 우세 + 지속 시간
+    if wm >= drainEps and holdMass > massRatio * wm and (holdLastAt - holdStartAt) * 1000 >= spanMs then
+        local oL, oF, oP = doFlip(now)
+        scrollStats.flips = scrollStats.flips + 1
+        scrollStats.passed = scrollStats.passed + 1
+        return oL, oF, oP, "flip"
+    end
+
+    scrollStats.held = scrollStats.held + 1
+    return 0, 0, 0, decision
 end
 
 scrollDebouncer = eventtap.new(
@@ -177,7 +185,6 @@ scrollDebouncer = eventtap.new(
             return false
         end
 
-        -- delta 3성분 모두 확보(누적-방출에 3성분 다 필요).
         local lineDelta = e:getProperty(props.scrollWheelEventDeltaAxis1)
         local fpDelta   = e:getProperty(props.scrollWheelEventFixedPtDeltaAxis1)
         local ptDelta   = e:getProperty(props.scrollWheelEventPointDeltaAxis1)
@@ -186,9 +193,38 @@ scrollDebouncer = eventtap.new(
         end
 
         local outDa1, outFp, outPt, decision = scrollProcessDeltas(lineDelta, fpDelta, ptDelta)
+
+        if decision == "holdStart" or decision == "hold" then
+            heldEventCopy = e:copy()
+            if decision == "holdStart" then
+                if holdTimer then holdTimer:stop() end
+                local function timerCheck()
+                    holdTimer = nil
+                    local fl, ff, fp2, status = scrollTimerCheck()
+                    if status == "flip" then
+                        if heldEventCopy then
+                            heldEventCopy:setProperty(props.scrollWheelEventDeltaAxis1, fl)
+                            heldEventCopy:setProperty(props.scrollWheelEventFixedPtDeltaAxis1, ff)
+                            heldEventCopy:setProperty(props.scrollWheelEventPointDeltaAxis1, fp2)
+                            heldEventCopy:post()
+                        end
+                        heldEventCopy = nil
+                    elseif status == "holding" then
+                        -- 창이 아직 안 비었음(미드스트림 보류) → 창 소진 때까지 재검사
+                        holdTimer = hs.timer.doAfter(0.05, timerCheck)
+                    else
+                        heldEventCopy = nil
+                    end
+                end
+                holdTimer = hs.timer.doAfter(holdMs / 1000, timerCheck)
+            end
+        elseif decision == "absorb" or decision == "flip" then
+            if holdTimer then holdTimer:stop(); holdTimer = nil end
+            heldEventCopy = nil
+        end
+
         if outDa1 ~= lineDelta or outFp ~= fpDelta or outPt ~= ptDelta then
             -- 삭제(return true)는 이 환경서 무효이므로 delta를 직접 수정한다.
-            -- (suppress=0화, dump-pass=보류분 합산 — 값이 달라진 경우만 set)
             e:setProperty(props.scrollWheelEventDeltaAxis1, outDa1)
             e:setProperty(props.scrollWheelEventFixedPtDeltaAxis1, outFp)
             e:setProperty(props.scrollWheelEventPointDeltaAxis1, outPt)
